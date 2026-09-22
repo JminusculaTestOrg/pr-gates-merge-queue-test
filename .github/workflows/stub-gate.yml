@@ -1,0 +1,168 @@
+name: stub-gate
+
+# This workflow stands in for a PR Gate. It is the REQUIRED status check, so it
+# must run on both `pull_request` and `merge_group` with the SAME job name --
+# a required check that never reports on a merge group stalls the queue entry
+# until the ruleset's check_response_timeout_minutes elapses.
+#
+# Verdict logic is deliberately asymmetric:
+#   pull_request -> always success (even for a culprit)
+#   merge_group  -> fail if any findings/*.txt in the group's tree says PRGATE_FAIL
+#
+# The asymmetry is required, not cosmetic: a PR whose own required check fails
+# can never be added to the queue, so a "latent" defect is the only way to get a
+# culprit into a batch. It also models the case we actually care about -- a
+# problem that exists only in the merged result.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+
+# Record every attempt. Cancelling would destroy evidence of re-formed groups.
+concurrency:
+  group: stub-gate-${{ github.event.merge_group.head_ref || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stub-gate:
+    # This string is the required-status-check context. Keep it in sync with
+    # REQUIRED_CHECK_CONTEXT in scripts/lib.sh.
+    name: stub-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Capture raw webhook payload
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/evidence
+          cp "$GITHUB_EVENT_PATH" /tmp/evidence/event.json
+          {
+            echo "## Event: \`$GITHUB_EVENT_NAME\`"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| github.ref | \`$GITHUB_REF\` |"
+            echo "| github.sha | \`$GITHUB_SHA\` |"
+            echo "| run attempt | $GITHUB_RUN_ATTEMPT |"
+            echo
+            echo "### Raw payload"
+            echo '```json'
+            jq '.' /tmp/evidence/event.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "--- raw payload ---"
+          jq '.' /tmp/evidence/event.json
+
+      # QUESTION 1: does the merge_group payload name the PRs in the group, or
+      # only the trailing one? This isolates the answer from the noise above.
+      - name: Extract merge_group fields
+        if: github.event_name == 'merge_group'
+        run: |
+          set -euo pipefail
+          {
+            echo "### merge_group object keys"
+            echo '```'
+            jq -r '.merge_group | keys[]' /tmp/evidence/event.json
+            echo '```'
+            echo "### Any PR numbers anywhere in the payload?"
+            echo '```'
+            jq -r '[paths(scalars) as $p | {path: ($p|join(".")), value: getpath($p)}]
+                   | map(select(.path | test("pull_request|number|pr_"; "i")))
+                   | if length == 0 then "NONE FOUND" else .[] | "\(.path) = \(.value)" end' \
+                   /tmp/evidence/event.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve base/head for this event
+        id: range
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            base=$(jq -r '.merge_group.base_sha' /tmp/evidence/event.json)
+            head=$(jq -r '.merge_group.head_sha' /tmp/evidence/event.json)
+          else
+            base=$(jq -r '.pull_request.base.sha' /tmp/evidence/event.json)
+            head=$(jq -r '.pull_request.head.sha' /tmp/evidence/event.json)
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      # QUESTION 2: how many PRs does one merge group actually contain? The
+      # commit subjects in base..head name them even if the payload does not.
+      - name: Describe the evaluated range
+        run: |
+          set -euo pipefail
+          base='${{ steps.range.outputs.base }}'
+          head='${{ steps.range.outputs.head }}'
+          git fetch --quiet origin "$base" "$head" 2>/dev/null || true
+          {
+            echo "### Evaluated range \`${base:0:8}..${head:0:8}\`"
+            echo "#### Commits"
+            echo '```'
+            git log --oneline --no-decorate "$base..$head" || echo "(range unavailable)"
+            echo '```'
+            echo "#### Changed files"
+            echo '```'
+            git diff --name-only "$base..$head" || echo "(diff unavailable)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The gate itself. Scanning the tree (not the diff) mirrors the "union of
+      # findings across everything in this group" semantics of a reducer, and
+      # gives us per-PR attribution for free via the marker filenames.
+      - name: Evaluate gate
+        id: gate
+        run: |
+          set -euo pipefail
+          culprits=""
+          if [ -d findings ]; then
+            for f in findings/*.txt; do
+              [ -e "$f" ] || continue
+              if grep -q 'PRGATE_FAIL' "$f"; then
+                culprits="$culprits $f"
+              fi
+            done
+          fi
+          culprits="${culprits# }"
+          echo "culprits=$culprits" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
+            {
+              echo "### Verdict: PASS (pull_request)"
+              echo "Markers are latent by design; they only fail in a merge group."
+              [ -n "$culprits" ] && echo "Latent marker present in:\`$culprits\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -n "$culprits" ]; then
+            {
+              echo "### Verdict: FAIL (merge_group)"
+              echo
+              echo "Attributable to: \`$culprits\`"
+              echo
+              echo "> Note what this demonstrates: the gate knows exactly which"
+              echo "> PR poisoned the group. A test suite reporting one verdict"
+              echo "> for the same group cannot."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "FAIL: culprits =$culprits"
+            exit 1
+          fi
+
+          echo "### Verdict: PASS (merge_group)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ github.event_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/evidence/
+          retention-days: 30
+          if-no-files-found: warn

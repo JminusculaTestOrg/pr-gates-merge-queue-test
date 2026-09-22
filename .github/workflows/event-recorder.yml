@@ -1,0 +1,67 @@
+name: event-recorder
+
+# NOT a required check. Its only job is to answer: which events does a merge
+# queue actually emit, and on which refs?
+#
+# This matters for PR Gates specifically because ingestion today is
+# pull_request-only (pr-webhooks-forwarder drops every other event type), while
+# the scheduler is driven by provider data arriving for a commit SHA. So the
+# question is whether a gh-readonly-queue/** ref produces a push event that
+# could drive a scan, or whether merge_group is the only signal.
+#
+# LIMITATION: GitHub Actions only surfaces `merge_group: checks_requested`.
+# The `destroyed` action, and the exact shape of what a webhook consumer like
+# pr-webhooks-forwarder would receive, need an external webhook sink to observe.
+
+on:
+  push:
+    branches:
+      - '**'
+      - 'gh-readonly-queue/**'
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  merge_group:
+  create:
+  delete:
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: record-event
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/evidence
+          cp "$GITHUB_EVENT_PATH" /tmp/evidence/event.json
+          is_queue_ref=no
+          case "$GITHUB_REF" in
+            refs/heads/gh-readonly-queue/*) is_queue_ref=yes ;;
+          esac
+          {
+            echo "## \`$GITHUB_EVENT_NAME\` on \`$GITHUB_REF\`"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| event | \`$GITHUB_EVENT_NAME\` |"
+            echo "| ref | \`$GITHUB_REF\` |"
+            echo "| sha | \`$GITHUB_SHA\` |"
+            echo "| **is a merge-queue ref** | **$is_queue_ref** |"
+            echo
+            echo '```json'
+            jq '.' /tmp/evidence/event.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF queue_ref=$is_queue_ref"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorder-${{ github.event_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/evidence/
+          retention-days: 30
+          if-no-files-found: warn
