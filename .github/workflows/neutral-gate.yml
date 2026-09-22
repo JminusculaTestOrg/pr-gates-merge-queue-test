@@ -1,0 +1,66 @@
+name: neutral-gate-publisher
+
+# Experiment: does a check run with conclusion `neutral` satisfy a merge-queue
+# required status check?
+#
+# This matters for the case where a queued PR has no usable stored verdict
+# (results expired, repo newly onboarded, gate still pending at enqueue time).
+# The options there are success (vouching for something we did not evaluate),
+# failure (ejecting a PR for an infrastructural reason), or neutral -- if the
+# queue accepts it.
+#
+# Actions jobs cannot conclude `neutral`; only success/failure/cancelled/
+# skipped. So instead of relying on the job's own check, this publishes a check
+# run explicitly via the Checks API using GITHUB_TOKEN, which authenticates as
+# the GitHub Actions app. (A PAT cannot: POST /check-runs requires an App.)
+# That also mirrors how PR Gates publishes, via Checks.CreateCheckRun.
+#
+# Asymmetric on purpose, same trick as stub-gate: success on pull_request so
+# the PR can be enqueued at all, neutral on merge_group so the queue's handling
+# of neutral is what gets measured.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+
+permissions:
+  checks: write
+  contents: read
+
+jobs:
+  publish:
+    # Deliberately NOT named neutral-gate: the job produces its own check run
+    # named after the job, and the required context must be the one published
+    # below, not this job's.
+    name: neutral-publisher
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish neutral-gate check run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            sha=$(jq -r '.merge_group.head_sha' "$GITHUB_EVENT_PATH")
+            conclusion=neutral
+          else
+            sha=$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
+            conclusion=success
+          fi
+
+          gh api --method POST "/repos/$GITHUB_REPOSITORY/check-runs" \
+            -f name='neutral-gate' \
+            -f head_sha="$sha" \
+            -f status='completed' \
+            -f conclusion="$conclusion" \
+            -f 'output[title]=neutral conclusion experiment' \
+            -f "output[summary]=event=$GITHUB_EVENT_NAME conclusion=$conclusion" \
+            --jq '"created check_run id=\(.id) name=\(.name) conclusion=\(.conclusion)"'
+
+          {
+            echo "## neutral-gate published"
+            echo "- event: \`$GITHUB_EVENT_NAME\`"
+            echo "- head_sha: \`$sha\`"
+            echo "- **conclusion: \`$conclusion\`**"
+          } >> "$GITHUB_STEP_SUMMARY"
